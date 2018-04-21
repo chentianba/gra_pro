@@ -1,9 +1,9 @@
 CC = clang
-all: main.o algorithm.o
-	${CC} -o main main.o algorithm.o
-main.o: main.c algorithm.h
-	${CC} -c main.c algorithm.h
-algorithm.o: algorithm.c algorithm.h
-	${CC} -c algorithm.c algorithm.h
+all: main.o bloom_filter.o
+	${CC} -o main main.o bloom_filter.o
+main.o: main.c bloom_filter.h
+	${CC} -c main.c bloom_filter.h
+bloom_filter.o: bloom_filter.c bloom_filter.h
+	${CC} -c bloom_filter.c bloom_filter.h
 clean:
-	rm -f main main.o algorithm.o
+	rm -f main main.o bloom_filter.o
