@@ -1,11 +1,17 @@
 CC = clang
-all: main.o bloom_filter.o cuckoo_filter.o
-	${CC} -o main main.o bloom_filter.o cuckoo_filter.o
-main.o: main.c bloom_filter.h
-	${CC} -c main.c bloom_filter.h
-bloom_filter.o: bloom_filter.c bloom_filter.h
-	${CC} -c bloom_filter.c bloom_filter.h
-cuckoo_filter.o: cuckoo_filter.c cuckoo_filter.h
-	${CC} -c cuckoo_filter.c cuckoo_filter.h
+INCLUDE_DIRS = include/
+CCFLAGS = -I $(INCLUDE_DIRS) -Wall
+OBJ_DIR = obj
+SRC_DIR = src
+TARGET = main
+
+SRCS = $(foreach dir, $(SRC_DIR), $(wildcard $(dir)/*.c))
+OBJS = $(addprefix $(OBJ_DIR)/, $(patsubst %.c, %.o, $(notdir $(SRCS))))
+
+$(TARGET): $(OBJS)
+	$(CC) -o $@ $^
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
+	@if [ ! -d $(OBJ_DIR) ]; then mkdir -p $(OBJ_DIR); fi;
+	$(CC) $(CCFLAGS) -c $^ -o $@
 clean:
-	rm -f main main.o bloom_filter.o
+	rm -rf main $(OBJ_DIR)
