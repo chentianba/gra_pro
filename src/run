@@ -1,0 +1,3 @@
+#! /bin/bash
+
+sudo ./build/flow_classify -c f -n 4

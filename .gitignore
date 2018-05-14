@@ -2,3 +2,4 @@
 *.gch
 main
 src/tags
+src/.*

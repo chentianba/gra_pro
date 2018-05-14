@@ -34,6 +34,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <getopt.h>
+#include <signal.h>
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
@@ -44,8 +45,13 @@
 #include <rte_flow_classify.h>
 #include <rte_table_acl.h>
 
+#include <libtstat.h>
+
+#include "bloom_filter.h"
+
 #define RX_RING_SIZE 128
 #define TX_RING_SIZE 512
+#define SCHED_TX_RING_SZ 65536
 
 #define NUM_MBUFS 8191
 #define MBUF_CACHE_SIZE 250
@@ -56,151 +62,149 @@
 #define FLOW_CLASSIFY_MAX_PRIORITY 8
 #define FLOW_CLASSIFIER_NAME_SIZE 64
 
-#define COMMENT_LEAD_CHAR	('#')
-#define OPTION_RULE_IPV4	"rule_ipv4"
-#define RTE_LOGTYPE_FLOW_CLASSIFY	RTE_LOGTYPE_USER3
-#define flow_classify_log(format, ...) \
-		RTE_LOG(ERR, FLOW_CLASSIFY, format, ##__VA_ARGS__)
-
-#define uint32_t_to_char(ip, a, b, c, d) do {\
-		*a = (unsigned char)(ip >> 24 & 0xff);\
-		*b = (unsigned char)(ip >> 16 & 0xff);\
-		*c = (unsigned char)(ip >> 8 & 0xff);\
-		*d = (unsigned char)(ip & 0xff);\
-	} while (0)
-
-enum {
-	CB_FLD_SRC_ADDR,
-	CB_FLD_DST_ADDR,
-	CB_FLD_SRC_PORT,
-	CB_FLD_SRC_PORT_DLM,
-	CB_FLD_SRC_PORT_MASK,
-	CB_FLD_DST_PORT,
-	CB_FLD_DST_PORT_DLM,
-	CB_FLD_DST_PORT_MASK,
-	CB_FLD_PROTO,
-	CB_FLD_PRIORITY,
-	CB_FLD_NUM,
-};
-
-static struct{
-	const char *rule_ipv4_name;
-} parm_config;
-const char cb_port_delim[] = ":";
-
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = { .max_rx_pkt_len = ETHER_MAX_LEN }
 };
 
-struct flow_classifier {
-	struct rte_flow_classifier *cls;
-	uint32_t table_id[RTE_FLOW_CLASSIFY_TABLE_MAX];
-};
-
-struct flow_classifier_acl {
-	struct flow_classifier cls;
-} __rte_cache_aligned;
-
-/* ACL field definitions for IPv4 5 tuple rule */
-
-enum {
-	PROTO_FIELD_IPV4,
-	SRC_FIELD_IPV4,
-	DST_FIELD_IPV4,
-	SRCP_FIELD_IPV4,
-	DSTP_FIELD_IPV4,
-	NUM_FIELDS_IPV4
-};
-
-enum {
-	PROTO_INPUT_IPV4,
-	SRC_INPUT_IPV4,
-	DST_INPUT_IPV4,
-	SRCP_DESTP_INPUT_IPV4
-};
-
-static struct rte_acl_field_def ipv4_defs[NUM_FIELDS_IPV4] = {
-	/* first input field - always one byte long. */
-	{
-		.type = RTE_ACL_FIELD_TYPE_BITMASK,
-		.size = sizeof(uint8_t),
-		.field_index = PROTO_FIELD_IPV4,
-		.input_index = PROTO_INPUT_IPV4,
-		.offset = sizeof(struct ether_hdr) +
-			offsetof(struct ipv4_hdr, next_proto_id),
-	},
-	/* next input field (IPv4 source address) - 4 consecutive bytes. */
-	{
-		/* rte_flow uses a bit mask for IPv4 addresses */
-		.type = RTE_ACL_FIELD_TYPE_BITMASK,
-		.size = sizeof(uint32_t),
-		.field_index = SRC_FIELD_IPV4,
-		.input_index = SRC_INPUT_IPV4,
-		.offset = sizeof(struct ether_hdr) +
-			offsetof(struct ipv4_hdr, src_addr),
-	},
-	/* next input field (IPv4 destination address) - 4 consecutive bytes. */
-	{
-		/* rte_flow uses a bit mask for IPv4 addresses */
-		.type = RTE_ACL_FIELD_TYPE_BITMASK,
-		.size = sizeof(uint32_t),
-		.field_index = DST_FIELD_IPV4,
-		.input_index = DST_INPUT_IPV4,
-		.offset = sizeof(struct ether_hdr) +
-			offsetof(struct ipv4_hdr, dst_addr),
-	},
-	/*
-	 * Next 2 fields (src & dst ports) form 4 consecutive bytes.
-	 * They share the same input index.
-	 */
-	{
-		/* rte_flow uses a bit mask for protocol ports */
-		.type = RTE_ACL_FIELD_TYPE_BITMASK,
-		.size = sizeof(uint16_t),
-		.field_index = SRCP_FIELD_IPV4,
-		.input_index = SRCP_DESTP_INPUT_IPV4,
-		.offset = sizeof(struct ether_hdr) +
-			sizeof(struct ipv4_hdr) +
-			offsetof(struct tcp_hdr, src_port),
-	},
-	{
-		/* rte_flow uses a bit mask for protocol ports */
-		.type = RTE_ACL_FIELD_TYPE_BITMASK,
-		.size = sizeof(uint16_t),
-		.field_index = DSTP_FIELD_IPV4,
-		.input_index = SRCP_DESTP_INPUT_IPV4,
-		.offset = sizeof(struct ether_hdr) +
-			sizeof(struct ipv4_hdr) +
-			offsetof(struct tcp_hdr, dst_port),
-	},
-};
-
 /* flow classify data */
 static int num_classify_rules;
-static struct rte_flow_classify_rule *rules[MAX_NUM_CLASSIFY];
-static struct rte_flow_classify_ipv4_5tuple_stats ntuple_stats;
-static struct rte_flow_classify_stats classify_stats = {
-		.stats = (void **)&ntuple_stats
-};
 
-/* parameters for rte_flow_classify_validate and
- * rte_flow_classify_table_entry_add functions
- */
+static struct rte_eth_ntuple_filter rules[MAX_NUM_CLASSIFY];
 
-static struct rte_flow_item  eth_item = { RTE_FLOW_ITEM_TYPE_ETH,
-	0, 0, 0 };
-static struct rte_flow_item  end_item = { RTE_FLOW_ITEM_TYPE_END,
-	0, 0, 0 };
+/* Global bloom filter */
+static struct bloom_filter *gbf;
 
-/* sample actions:
- * "actions count / end"
- */
-static struct rte_flow_action count_action = { RTE_FLOW_ACTION_TYPE_COUNT, 0};
-static struct rte_flow_action end_action = { RTE_FLOW_ACTION_TYPE_END, 0};
-static struct rte_flow_action actions[2];
+#define BF_MAX_BIT 4096
+#define BF_MAX_HASH_NUM 3
+#define KEY_BYTE_SIZE 16
 
-/* sample attributes */
-static struct rte_flow_attr attr;
+static int
+add_rule(struct rte_eth_ntuple_filter *ntuple_filter)
+{
+	int ret = -1;
+
+	if (num_classify_rules >= MAX_NUM_CLASSIFY) {
+		printf("\nINFO: classify rule capacity %d reached\n",
+			num_classify_rules);
+		return ret;
+	}
+
+	memcpy(&rules[num_classify_rules], ntuple_filter,
+		sizeof(struct rte_eth_ntuple_filter));
+	num_classify_rules++;
+	return 0;
+}
+
+static void
+print_mbuf(struct rte_mbuf *buf) {
+	struct ether_hdr *eth;
+	struct ipv4_hdr *ip_hdr;
+	uint8_t *data;
+
+	if (buf == NULL) return;
+
+	eth = (struct ether_hdr *)(rte_pktmbuf_mtod(buf, uint8_t *));
+	printf("eth src addr:%02x-%02x-%02x-%02x-%02x-%02x,"
+		"eth dst addr:%02x-%02x-%02x-%02x-%02x-%02x\n",
+		eth->s_addr.addr_bytes[0], eth->s_addr.addr_bytes[1],
+		eth->s_addr.addr_bytes[2], eth->s_addr.addr_bytes[3],
+		eth->s_addr.addr_bytes[4], eth->s_addr.addr_bytes[5],
+		eth->d_addr.addr_bytes[0], eth->d_addr.addr_bytes[1],
+		eth->d_addr.addr_bytes[2], eth->d_addr.addr_bytes[3],
+		eth->d_addr.addr_bytes[4], eth->d_addr.addr_bytes[5]);
+	ip_hdr = (struct ipv4_hdr *)(rte_pktmbuf_mtod(buf, uint8_t *) +
+			sizeof(struct ether_hdr));
+	data = (uint8_t *)(&(ip_hdr->src_addr));
+	printf("src ip:%u:%u:%u:%u, ",
+		data[0], data[1], data[2], data[3]);
+	data = (uint8_t *)(&(ip_hdr->dst_addr));
+	printf("dst ip:%u:%u:%u:%u  ",
+		data[0], data[1], data[2], data[3]);
+	printf("proto:%u ", ip_hdr->next_proto_id);
+	printf("src port:%u(%x) dst port:%u(%x)\n",
+		rte_bswap16(*(uint16_t *)(ip_hdr + 1)),
+		rte_bswap16(*(uint16_t *)(ip_hdr + 1)),
+		rte_bswap16(*((uint16_t *)(ip_hdr + 1) + 1)),
+		rte_bswap16(*((uint16_t *)(ip_hdr + 1) + 1)));
+}
+
+static int
+__query_rule(struct rte_mbuf *buf, 
+		struct rte_eth_ntuple_filter *nfilter) {
+	struct ipv4_hdr *ip_hdr;
+	uint16_t src_port, dst_port, sport, dport;
+	uint32_t src_ip, dst_ip, hs_ip, hd_ip;
+	uint8_t proto;
+
+	ip_hdr = (struct ipv4_hdr *)(rte_pktmbuf_mtod(buf, uint8_t *) +
+			sizeof(struct ether_hdr));
+	src_ip = (nfilter->src_ip & nfilter->src_ip_mask);
+	dst_ip = (nfilter->dst_ip & nfilter->dst_ip_mask);
+	proto = (nfilter->proto & nfilter->proto_mask);
+	hs_ip = rte_be_to_cpu_32(ip_hdr->src_addr);
+	hd_ip = rte_be_to_cpu_32(ip_hdr->dst_addr);
+	if (nfilter->src_ip_mask != 0 && hs_ip != src_ip)
+		return 0;
+	if (nfilter->dst_ip_mask != 0 && hd_ip != dst_ip)
+		return 0;
+	if (nfilter->proto_mask != 0 && ip_hdr->next_proto_id != proto)
+		return 0;
+	src_port = (nfilter->src_port & nfilter->src_port_mask);
+	dst_port = (nfilter->dst_port &	nfilter->dst_port_mask);
+	sport = *(uint16_t *)(ip_hdr + 1);
+	dport = *((uint16_t *)(ip_hdr +1) + 1);
+	if (nfilter->src_port_mask != 0 && sport != src_port)
+		return 0;
+	if (nfilter->dst_port_mask != 0 && dport != dst_port)
+		return 0;
+	return 1;
+}
+
+static int
+query_rules(struct rte_mbuf *buf) {
+	int i;
+	for (i = 0; i < num_classify_rules; ++i) {
+		if (__query_rule(buf, &rules[i]))
+			return i;
+	}
+	return -1;
+}
+
+static int
+set_rules(void) {
+	struct rte_eth_ntuple_filter ntuple_filter;
+
+	/* first rule(tcp) */
+	ntuple_filter.dst_ip = IPv4(10,10,10,10);
+	ntuple_filter.dst_ip_mask = 32;
+	ntuple_filter.src_ip = IPv4(0,0,0,0);
+	ntuple_filter.src_ip_mask = 0;
+	ntuple_filter.dst_port = ntuple_filter.src_port = 0;
+	ntuple_filter.dst_port_mask = ntuple_filter.src_port_mask = 0;
+	ntuple_filter.proto = 6;
+	ntuple_filter.proto_mask = 0x0;
+	ntuple_filter.priority = 1;
+	if (add_rule(&ntuple_filter) == -1) {
+		rte_exit(EXIT_FAILURE, "Add rule failure.\n");
+	}
+
+	/* second rule(udp) */
+	ntuple_filter.dst_ip = IPv4(10,10,10,10);
+	ntuple_filter.dst_ip_mask = 0;
+	ntuple_filter.src_ip = IPv4(0,0,0,0);
+	ntuple_filter.src_ip_mask = 0;
+	ntuple_filter.dst_port = ntuple_filter.src_port = 0;
+	ntuple_filter.dst_port_mask = ntuple_filter.src_port_mask = 0x0000;
+	ntuple_filter.proto = 17;
+	ntuple_filter.proto_mask = 0x00;
+	ntuple_filter.priority = 2;
+	if (add_rule(&ntuple_filter) == -1) {
+		rte_exit(EXIT_FAILURE, "Add rule failure.\n");
+	}
+
+	return 0;
+}
+
 
 /* flow_classify.c: * Based on DPDK skeleton forwarding example. */
 
@@ -261,24 +265,95 @@ port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 	return 0;
 }
 
+static uint32_t
+get_key_from_mbuf(struct rte_mbuf *mbuf, uint8_t *key, uint32_t *len)
+{
+	struct ipv4_hdr *ip_hdr;
+	uint32_t data32;
+	uint16_t data16;
+	uint8_t data8;
+
+	ip_hdr = (struct ipv4_hdr *)(rte_pktmbuf_mtod(mbuf, uint8_t *) + 
+			sizeof(struct ether_hdr));
+	data32 = rte_be_to_cpu_32(ip_hdr->src_addr);
+	memcpy(key, &data32, sizeof(data32));
+
+	data32 = rte_be_to_cpu_32(ip_hdr->dst_addr);
+	memcpy(key + 4, &data32, sizeof(data32));
+
+	data16 = rte_be_to_cpu_16(*(uint16_t *)(ip_hdr + 1));
+	memcpy(key + 8, &data16, sizeof(data16));
+
+	data16 = rte_be_to_cpu_16(*((uint16_t *)(ip_hdr + 1) + 1));
+	memcpy(key + 10, &data16, sizeof(data16));
+
+	data8 = ip_hdr->next_proto_id;
+	memcpy(key + 12, &data8, sizeof(data8));
+	(*len) = 13;
+	return 13;
+}
+
+static void
+process_mbuf(__attribute__((unused)) struct rte_ring *rcv_ring, 
+		struct rte_mbuf *mbuf)
+{
+	uint8_t key[KEY_BYTE_SIZE];
+	uint32_t len;
+	int ret;
+
+	// print_mbuf(mbuf);
+	print_mbuf(NULL);
+	get_key_from_mbuf(mbuf, key, &len);
+
+	// bf_print(gbf);
+	if (bf_lookup(gbf, key, len)) {
+		/* transmit to tstat application. */
+		uint16_t sent = rte_ring_enqueue_burst(rcv_ring,
+				(void *)&mbuf, 1, NULL);
+		if (sent < 1) {
+			printf("Warning:\tRing enqueue fails\n");
+		}
+		printf("Lookup success! Packet sent to app\n");
+	}
+	else {
+		/*
+		 * test whether packet matches rules
+		 * if matches, add into bf and transmit to app
+		 * else drop it.
+		 */
+		ret = query_rules(mbuf);
+		if (ret != -1) {
+			/* match success */
+			if (bf_insert(gbf, key, len) == 0) {
+				rte_exit(EXIT_FAILURE, "BF insertion fails.\n");
+			}
+			//==========transmit to app ===========
+			uint16_t sent = rte_ring_enqueue_burst(rcv_ring,
+					(void *)&mbuf, 1, NULL);
+			if (sent < 1) {
+				printf("Warning:\tRing enqueue fails\n");
+			}
+			printf("Query matches! Packet sent to app\n");
+			printf("Success and rule %d matches.\n", ret);
+		} else {
+			/* not match */
+			printf("Failure and rule match fails.\n");
+		}
+	}
+	printf("\n");
+}
+
 /*
  * The lcore main. This is the main thread that does the work, reading from
- * an input port classifying the packets and writing to an output port.
+ * an input port and processing the packets.
  */
 static __attribute__((noreturn)) void
-lcore_main(struct flow_classifier *cls_app)
+lcore_main(struct rte_ring *rcv_ring)
 {
 	const uint8_t nb_ports = rte_eth_dev_count();
 	uint8_t port;
-	int ret;
+	// int ret;
 	int i = 0;
-
-	ret = rte_flow_classify_table_entry_delete(cls_app->cls,
-			cls_app->table_id[0], rules[7]);
-	if (ret)
-		printf("table_entry_delete failed [7] %d\n\n", ret);
-	else
-		printf("table_entry_delete succeeded [7]\n\n");
 
 	/*
 	 * Check that the port is on the same NUMA node as the polling thread
@@ -313,238 +388,57 @@ lcore_main(struct flow_classifier *cls_app)
 			if (unlikely(nb_rx == 0))
 				continue;
 
-			for (i = 0; i < num_classify_rules; i++) {
-				if (rules[i]) {
-					ret = rte_flow_classifier_query(
-						cls_app->cls,
-						cls_app->table_id[0],
-						bufs, nb_rx, rules[i],
-						&classify_stats);
-					if (ret)
-						printf(
-							"rule [%d] query failed ret [%d]\n\n",
-							i, ret);
-					else {
-						printf(
-						"rule[%d] count=%"PRIu64"\n",
-						i, ntuple_stats.counter1);
-
-						printf("proto = %d\n",
-						ntuple_stats.ipv4_5tuple.proto);
-					}
-				}
+			printf("nb_rx = %d\n", nb_rx);
+			for (i = 0; i < nb_rx; i++) {
+				process_mbuf(rcv_ring, bufs[i]);
 			}
 
 			/* Send burst of TX packets, to second port of pair. */
-			const uint16_t nb_tx = rte_eth_tx_burst(port ^ 1, 0,
-					bufs, nb_rx);
+			// const uint16_t nb_tx = rte_eth_tx_burst(port ^ 1, 0,
+			// 		bufs, nb_rx);
 
 			/* Free any unsent packets. */
-			if (unlikely(nb_tx < nb_rx)) {
-				uint16_t buf;
+			// if (unlikely(nb_tx < nb_rx)) {
+			// 	uint16_t buf;
 
-				for (buf = nb_tx; buf < nb_rx; buf++)
-					rte_pktmbuf_free(bufs[buf]);
-			}
+			// 	for (buf = nb_tx; buf < nb_rx; buf++)
+			// 		rte_pktmbuf_free(bufs[buf]);
+			// }
 		}
 	}
 }
 
-static uint32_t
-convert_depth_to_bitmask(uint32_t depth_val)
-{
-	uint32_t bitmask = 0;
-	int i, j;
-
-	for (i = depth_val, j = 0; i > 0; i--, j++)
-		bitmask |= (1 << (31 - j));
-	return bitmask;
-}
-
+/*
+ * The process running tstat application and settling down
+ * receiving packets.
+ */
 static int
-add_classify_rule(struct rte_eth_ntuple_filter *ntuple_filter,
-		struct flow_classifier *cls_app)
+tstat_process(__attribute__((unused)) struct rte_ring *rcv_ring)
 {
-	int ret = -1;
-	int key_found;
-	struct rte_flow_error error;
-	struct rte_flow_item_ipv4 ipv4_spec;
-	struct rte_flow_item_ipv4 ipv4_mask;
-	struct rte_flow_item ipv4_udp_item;
-	struct rte_flow_item ipv4_tcp_item;
-	struct rte_flow_item ipv4_sctp_item;
-	struct rte_flow_item_udp udp_spec;
-	struct rte_flow_item_udp udp_mask;
-	struct rte_flow_item udp_item;
-	struct rte_flow_item_tcp tcp_spec;
-	struct rte_flow_item_tcp tcp_mask;
-	struct rte_flow_item tcp_item;
-	struct rte_flow_item_sctp sctp_spec;
-	struct rte_flow_item_sctp sctp_mask;
-	struct rte_flow_item sctp_item;
-	struct rte_flow_item pattern_ipv4_5tuple[4];
-	struct rte_flow_classify_rule *rule;
-	uint8_t ipv4_proto;
+	struct timeval tv;
+	struct rte_mbuf *bufs[BURST_SIZE*4];
+	uint32_t i;
 
-	if (num_classify_rules >= MAX_NUM_CLASSIFY) {
-		printf(
-			"\nINFO:  classify rule capacity %d reached\n",
-			num_classify_rules);
-		return ret;
+	printf("Hello World from core %u.\n", rte_lcore_id());
+	for (;;) {
+		const uint16_t nb_rx = rte_ring_dequeue_burst(rcv_ring,
+				(void *)bufs, BURST_SIZE, NULL);
+		if (nb_rx) {
+			for (i = 0; i < nb_rx; ++i) {
+				tstat_next_pckt(&(tv), 
+				(void *)(rte_pktmbuf_mtod(bufs[i], char*) + 
+				sizeof(struct ether_hdr)), 
+				rte_pktmbuf_mtod(bufs[i], char*) +
+				rte_pktmbuf_data_len(bufs[i]) - 1,
+				(rte_pktmbuf_data_len(bufs[i]) -
+				 sizeof(struct ether_hdr)), 0);
+			}
+			for (i = 0; i < nb_rx; ++i) {
+				rte_pktmbuf_free(bufs[i]);
+			}
+		}
 	}
-
-	/* set up parameters for validate and add */
-	memset(&ipv4_spec, 0, sizeof(ipv4_spec));
-	ipv4_spec.hdr.next_proto_id = ntuple_filter->proto;
-	ipv4_spec.hdr.src_addr = ntuple_filter->src_ip;
-	ipv4_spec.hdr.dst_addr = ntuple_filter->dst_ip;
-	ipv4_proto = ipv4_spec.hdr.next_proto_id;
-
-	memset(&ipv4_mask, 0, sizeof(ipv4_mask));
-	ipv4_mask.hdr.next_proto_id = ntuple_filter->proto_mask;
-	ipv4_mask.hdr.src_addr = ntuple_filter->src_ip_mask;
-	ipv4_mask.hdr.src_addr =
-		convert_depth_to_bitmask(ipv4_mask.hdr.src_addr);
-	ipv4_mask.hdr.dst_addr = ntuple_filter->dst_ip_mask;
-	ipv4_mask.hdr.dst_addr =
-		convert_depth_to_bitmask(ipv4_mask.hdr.dst_addr);
-
-	switch (ipv4_proto) {
-	case IPPROTO_UDP:
-		ipv4_udp_item.type = RTE_FLOW_ITEM_TYPE_IPV4;
-		ipv4_udp_item.spec = &ipv4_spec;
-		ipv4_udp_item.mask = &ipv4_mask;
-		ipv4_udp_item.last = NULL;
-
-		udp_spec.hdr.src_port = ntuple_filter->src_port;
-		udp_spec.hdr.dst_port = ntuple_filter->dst_port;
-		udp_spec.hdr.dgram_len = 0;
-		udp_spec.hdr.dgram_cksum = 0;
-
-		udp_mask.hdr.src_port = ntuple_filter->src_port_mask;
-		udp_mask.hdr.dst_port = ntuple_filter->dst_port_mask;
-		udp_mask.hdr.dgram_len = 0;
-		udp_mask.hdr.dgram_cksum = 0;
-
-		udp_item.type = RTE_FLOW_ITEM_TYPE_UDP;
-		udp_item.spec = &udp_spec;
-		udp_item.mask = &udp_mask;
-		udp_item.last = NULL;
-
-		attr.priority = ntuple_filter->priority;
-		pattern_ipv4_5tuple[1] = ipv4_udp_item;
-		pattern_ipv4_5tuple[2] = udp_item;
-		break;
-	case IPPROTO_TCP:
-		ipv4_tcp_item.type = RTE_FLOW_ITEM_TYPE_IPV4;
-		ipv4_tcp_item.spec = &ipv4_spec;
-		ipv4_tcp_item.mask = &ipv4_mask;
-		ipv4_tcp_item.last = NULL;
-
-		memset(&tcp_spec, 0, sizeof(tcp_spec));
-		tcp_spec.hdr.src_port = ntuple_filter->src_port;
-		tcp_spec.hdr.dst_port = ntuple_filter->dst_port;
-
-		memset(&tcp_mask, 0, sizeof(tcp_mask));
-		tcp_mask.hdr.src_port = ntuple_filter->src_port_mask;
-		tcp_mask.hdr.dst_port = ntuple_filter->dst_port_mask;
-
-		tcp_item.type = RTE_FLOW_ITEM_TYPE_TCP;
-		tcp_item.spec = &tcp_spec;
-		tcp_item.mask = &tcp_mask;
-		tcp_item.last = NULL;
-
-		attr.priority = ntuple_filter->priority;
-		pattern_ipv4_5tuple[1] = ipv4_tcp_item;
-		pattern_ipv4_5tuple[2] = tcp_item;
-		break;
-	case IPPROTO_SCTP:
-		ipv4_sctp_item.type = RTE_FLOW_ITEM_TYPE_IPV4;
-		ipv4_sctp_item.spec = &ipv4_spec;
-		ipv4_sctp_item.mask = &ipv4_mask;
-		ipv4_sctp_item.last = NULL;
-
-		sctp_spec.hdr.src_port = ntuple_filter->src_port;
-		sctp_spec.hdr.dst_port = ntuple_filter->dst_port;
-		sctp_spec.hdr.cksum = 0;
-		sctp_spec.hdr.tag = 0;
-
-		sctp_mask.hdr.src_port = ntuple_filter->src_port_mask;
-		sctp_mask.hdr.dst_port = ntuple_filter->dst_port_mask;
-		sctp_mask.hdr.cksum = 0;
-		sctp_mask.hdr.tag = 0;
-
-		sctp_item.type = RTE_FLOW_ITEM_TYPE_SCTP;
-		sctp_item.spec = &sctp_spec;
-		sctp_item.mask = &sctp_mask;
-		sctp_item.last = NULL;
-
-		attr.priority = ntuple_filter->priority;
-		pattern_ipv4_5tuple[1] = ipv4_sctp_item;
-		pattern_ipv4_5tuple[2] = sctp_item;
-		break;
-	default:
-		return ret;
-	}
-
-	attr.ingress = 1;
-	pattern_ipv4_5tuple[0] = eth_item;
-	pattern_ipv4_5tuple[3] = end_item;
-	actions[0] = count_action;
-	actions[1] = end_action;
-
-	rule = rte_flow_classify_table_entry_add(
-			cls_app->cls, cls_app->table_id[0], &key_found,
-			&attr, pattern_ipv4_5tuple, actions, &error);
-	if (rule == NULL) {
-		printf("table entry add failed ipv4_proto = %u\n",
-			ipv4_proto);
-		ret = -1;
-		return ret;
-	}
-
-	rules[num_classify_rules] = rule;
-	num_classify_rules++;
 	return 0;
-}
-
-static int
-set_rules(struct flow_classifier *cls_app) {
-	struct rte_eth_ntuple_filter ntuple_filter;
-
-	/* first rule(tcp) */
-	ntuple_filter.dst_ip = IPv4(10,10,10,10);
-	ntuple_filter.dst_ip_mask = 32;
-	ntuple_filter.src_ip = IPv4(0,0,0,0);
-	ntuple_filter.src_ip_mask = 0;
-	ntuple_filter.dst_port = ntuple_filter.src_port = 0;
-	ntuple_filter.dst_port_mask = ntuple_filter.src_port_mask = 0;
-	ntuple_filter.proto = 6;
-	ntuple_filter.priority = 1;
-	add_classify_rule(&ntuple_filter, cls_app);
-
-	/* second rule(udp) */
-	ntuple_filter.dst_ip = IPv4(10,10,10,10);
-	ntuple_filter.dst_ip_mask = 32;
-	ntuple_filter.src_ip = IPv4(0,0,0,0);
-	ntuple_filter.src_ip_mask = 0;
-	ntuple_filter.dst_port = ntuple_filter.src_port = 0;
-	ntuple_filter.dst_port_mask = ntuple_filter.src_port_mask = 0;
-	ntuple_filter.proto = 17;
-	ntuple_filter.priority = 2;
-	add_classify_rule(&ntuple_filter, cls_app);
-
-	return 0;
-}
-
-/* display usage */
-static void
-print_usage(const char *prgname)
-{
-	printf("%s usage:\n", prgname);
-	printf("[EAL options] --  --"OPTION_RULE_IPV4"=FILE: ");
-	printf("specify the ipv4 rules file.\n");
-	printf("Each rule occupies one line in the file.\n");
 }
 
 /* Parse the argument given in the command line of the application */
@@ -556,7 +450,6 @@ parse_args(int argc, char **argv)
 	int option_index;
 	char *prgname = argv[0];
 	static struct option lgopts[] = {
-		{OPTION_RULE_IPV4, 1, 0, 0},
 		{NULL, 0, 0, 0}
 	};
 
@@ -568,13 +461,8 @@ parse_args(int argc, char **argv)
 		switch (opt) {
 		/* long options */
 		case 0:
-			if (!strncmp(lgopts[option_index].name,
-					OPTION_RULE_IPV4,
-					sizeof(OPTION_RULE_IPV4)))
-				parm_config.rule_ipv4_name = optarg;
 			break;
 		default:
-			print_usage(prgname);
 			return -1;
 		}
 	}
@@ -585,6 +473,19 @@ parse_args(int argc, char **argv)
 	ret = optind-1;
 	optind = 1; /* reset getopt lib */
 	return ret;
+}
+
+/* Signal handling function */
+static void
+sig_handler(int signo)
+{
+	/* catch signal */
+	if (signo == SIGTERM || signo == SIGINT) {
+		tstat_report report;
+		tstat_close(&report);
+		tstat_print_report(&report, stdout);
+		exit(0);
+	}
 }
 
 /*
@@ -598,12 +499,13 @@ main(int argc, char *argv[])
 	uint8_t nb_ports;
 	uint8_t portid;
 	int ret;
-	int socket_id;
-	struct rte_table_acl_params table_acl_params;
-	struct rte_flow_classify_table_params cls_table_params;
-	struct flow_classifier *cls_app;
-	struct rte_flow_classifier_params cls_params;
-	uint32_t size;
+	struct rte_ring * rcv_ring;
+	unsigned int socket_id = 1;
+	char * conf_file = strdup("tstat.conf");
+	char * tstat_log = strdup("logs");
+
+	signal(SIGTERM, sig_handler);
+	signal(SIGINT, sig_handler);
 
 	/* Initialize the Environment Abstraction Layer (EAL). */
 	ret = rte_eal_init(argc, argv);
@@ -617,6 +519,15 @@ main(int argc, char *argv[])
 	ret = parse_args(argc, argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid flow_classify parameters\n");
+
+	/*
+	 * Check that there is an enough number of lcore
+	 * to run tstat application.
+	 */
+	if (rte_lcore_count() < 2) {
+		rte_exit(EXIT_FAILURE, "Error: Too few lcores enabled."
+				"There needs at least two lcores.\n");
+	}
 
 	/* Check that there is an enough number of ports to send/receive on. */
 	nb_ports = rte_eth_dev_count();
@@ -638,58 +549,39 @@ main(int argc, char *argv[])
 
 	if (rte_lcore_count() < 2) {
 		rte_exit(EXIT_FAILURE, "Too few lcores enabled. At least two lcores\n");
-		// printf("\nWARNING: Too many lcores enabled. Only 1 used.\n");
 	}
 
-	socket_id = rte_eth_dev_socket_id(0);
-
-	/* Memory allocation */
-	size = RTE_CACHE_LINE_ROUNDUP(sizeof(struct flow_classifier_acl));
-	cls_app = rte_zmalloc(NULL, size, RTE_CACHE_LINE_SIZE);
-	if (cls_app == NULL)
-		rte_exit(EXIT_FAILURE, "Cannot allocate classifier memory\n");
-
-	cls_params.name = "flow_classifier";
-	cls_params.socket_id = socket_id;
-	cls_params.type = RTE_FLOW_CLASSIFY_TABLE_TYPE_ACL;
-
-	cls_app->cls = rte_flow_classifier_create(&cls_params);
-	if (cls_app->cls == NULL) {
-		rte_free(cls_app);
-		rte_exit(EXIT_FAILURE, "Cannot create classifier\n");
-	}
-
-	/* initialise ACL table params */
-	table_acl_params.name = "table_acl_ipv4_5tuple";
-	table_acl_params.n_rules = FLOW_CLASSIFY_MAX_RULE_NUM;
-	table_acl_params.n_rule_fields = RTE_DIM(ipv4_defs);
-	memcpy(table_acl_params.field_format, ipv4_defs, sizeof(ipv4_defs));
-
-	/* initialise table create params */
-	cls_table_params.ops = &rte_table_acl_ops,
-	cls_table_params.arg_create = &table_acl_params,
-
-	ret = rte_flow_classify_table_create(cls_app->cls, &cls_table_params,
-			&cls_app->table_id[0]);
-	if (ret) {
-		rte_flow_classifier_free(cls_app->cls);
-		rte_free(cls_app);
-		rte_exit(EXIT_FAILURE, "Failed to create classifier table\n");
-	}
+	printf("======================\n");
 
 	// add rules.
-	if (set_rules(cls_app)) {
-		rte_flow_classifier_free(cls_app->cls);
-		rte_free(cls_app);
+	if (set_rules()) {
 		rte_exit(EXIT_FAILURE, "Failed to add rules\n");
 	}
 
-	/* Launch a remote lcore to run tstat. */
-	// Coding here...
+
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	tstat_init(conf_file);
+	tstat_new_logdir(tstat_log, &tv);
+
+	rcv_ring = rte_ring_create("Tstat_ring", SCHED_TX_RING_SZ,
+			rte_socket_id(), RING_F_SC_DEQ | RING_F_SP_ENQ);
+	if (rcv_ring == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create receiving ring\n");
+
+	/*
+	 * Launch a remote lcore to run tstat
+	 * on core 1.
+	 */
+	rte_eal_remote_launch((lcore_function_t *)tstat_process,
+			rcv_ring, socket_id);
+
+	/* Create Bloom filter and Cuckoo filter. */
+	gbf = bf_init(BF_MAX_BIT, BF_MAX_HASH_NUM);
 
 	/* Call lcore_main on the master core only. */
 	/* This function distributes the traffic to all kind of categories. */
-	lcore_main(cls_app);
+	lcore_main(rcv_ring);
 
 	return 0;
 }

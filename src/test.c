@@ -61,6 +61,7 @@ int main() {
 	debug_print(cf->hash_table);
 
 	/* Bloom Filter */
+	printf("Bloom Filter:\n");
  	struct bloom_filter *bf;
  	bf = bf_init(256, 3);
 	

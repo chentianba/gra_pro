@@ -9,7 +9,8 @@
 uint32_t g_pri_idx, g_sec_idx;
 uint8_t g_fingerprint;
 
-uint32_t cf_bucket_empty(struct cuckoo_filter *cf, uint32_t idx) {
+static uint32_t
+cf_bucket_empty(struct cuckoo_filter *cf, uint32_t idx) {
 	if (!cf || !cf->hash_table || !cf->hash_table->bkt_count) {
 		return NOT_EXIST;
 	}
@@ -19,7 +20,8 @@ uint32_t cf_bucket_empty(struct cuckoo_filter *cf, uint32_t idx) {
 	return NOT_EXIST;
 }
 
-fp_ptr cf_fingerprint(struct hash_table *ht, uint8_t *data,
+static fp_ptr
+cf_fingerprint(struct hash_table *ht, uint8_t *data,
 			  uint32_t len, fp_ptr fp) {
 	uint32_t init_val;
 
@@ -29,7 +31,8 @@ fp_ptr cf_fingerprint(struct hash_table *ht, uint8_t *data,
 	return fp;
 }
 
-uint32_t cf_hash(struct hash_table *ht, uint8_t *data,
+static uint32_t
+cf_hash(struct hash_table *ht, uint8_t *data,
 		 uint32_t len) {
 	uint8_t i;
 	uint8_t *val8;
@@ -54,7 +57,8 @@ uint32_t cf_hash(struct hash_table *ht, uint8_t *data,
 	return init_val%(ht->nb_bkt);
 }
 
-uint32_t cf_cmp_eq(uint8_t *data1, uint8_t *data2, uint32_t len) {
+static uint32_t
+cf_cmp_eq(uint8_t *data1, uint8_t *data2, uint32_t len) {
 	uint32_t i;
 	
 	for (i = 0; i < len; ++i) {
@@ -65,7 +69,8 @@ uint32_t cf_cmp_eq(uint8_t *data1, uint8_t *data2, uint32_t len) {
 	return SUCCESS;
 }
 
-uint32_t __cf_swap(uint8_t *data1, uint8_t *data2, uint32_t len) {
+static uint32_t
+__cf_swap(uint8_t *data1, uint8_t *data2, uint32_t len) {
 	uint8_t temp;
 	uint32_t i;
 	
@@ -79,7 +84,6 @@ uint32_t __cf_swap(uint8_t *data1, uint8_t *data2, uint32_t len) {
 struct hash_table *ht_init(uint32_t max_len, uint32_t nb_bkt,
 			   uint32_t nb_entry_bkt, uint32_t sz_entry) {
 	struct hash_table *ht;
-	uint32_t total_size;
 
 	/* Validate bounds every variable. */
 	if (max_len > MAX_TABLE_BYTE) {
@@ -248,8 +252,7 @@ uint32_t cf_delete(struct cuckoo_filter *cf, uint8_t *key, uint32_t klen) {
 	fp_ptr fp;
 	uint32_t bkt_sz;
 	uint32_t sz_entry;
-	uint32_t entry_pos;
-	uint32_t i, j;
+	uint32_t i;
 
 	ht = cf->hash_table;
 	bkt_sz = ht->sz_entry*ht->nb_entry_bkt;
@@ -292,8 +295,7 @@ uint32_t cf_lookup(struct cuckoo_filter *cf, uint8_t *key, uint32_t klen) {
 	fp_ptr fp;
 	uint32_t bkt_sz;
 	uint32_t sz_entry;
-	uint32_t entry_pos;
-	uint32_t i, j;
+	uint32_t i;
 
 	ht = cf->hash_table;
 	bkt_sz = ht->sz_entry*ht->nb_entry_bkt;

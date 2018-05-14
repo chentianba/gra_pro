@@ -10,7 +10,7 @@
 struct bloom_filter* bf_init(uint32_t bf_sz, uint32_t nb_hash) {
 	struct bloom_filter *bf;
 	uint32_t size;
-	int i;
+	unsigned int i;
 
 	/* init the filter of struct bloom_filter */
 	if (bf_sz > BF_MAX_SIZE) {
@@ -60,7 +60,8 @@ uint32_t bf_insert(struct bloom_filter *bf, uint8_t *key, uint32_t klen) {
 
 	for (i = 0; i < bf->nb_hash; ++i) {
 		pos = bf->hash_func(key, klen, bf->hash_init_val[i])%bf->length;
-		bf_set(bf, pos);
+		if (bf_set(bf, pos) == FAILURE)
+			return FAILURE;
 	}
 	return SUCCESS;
 }
@@ -134,7 +135,9 @@ uint32_t bf_print(struct bloom_filter* bf) {
 	for (idx = 0; idx < bf->length; ++idx) {
 		val = bf->filter[idx/8];
 		mask = ((uint8_t)1) << (idx%8);
-		printf("%d ", (val & mask) != 0); 
+		// printf("%d ", (val & mask) != 0); 
+		if ((val & mask) == 1)
+			printf("%d ", idx);
 	}
 	printf("\n");
 	return SUCCESS;
