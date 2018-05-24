@@ -39,14 +39,20 @@ RTE_TARGET ?= x86_64-native-linuxapp-gcc
 include $(RTE_SDK)/mk/rte.vars.mk
 
 # binary name
-APP = flow_classify
+APP = main
 
+ROOTDIR ?= $(shell pwd)/../../
 
 # all source are stored in SRCS-y
-SRCS-y := src/main.c src/bloom_filter.c src/cuckoo_filter.c
+SRCS-y := main.c bloom_filter.c cuckoo_filter.c
+
 
 CFLAGS += -O3
 CFLAGS += $(WERROR_FLAGS)
+
+CFLAGS += -I $(ROOTDIR)/include/
+
+LDLIBS = -L$(ROOTDIR)/lib -ltstat
 
 # workaround for a gcc bug with noreturn attribute
 # http://gcc.gnu.org/bugzilla/show_bug.cgi?id=12603

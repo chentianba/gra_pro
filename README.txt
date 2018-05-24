@@ -1,4 +1,4 @@
-系统实现了三中方案：
+系统实现了三种方案：
 bf/           ----Bloom filter实现的加速方案
 cf/           ----Cuckoo filter实现的加速方案
 tstat-dpdk    ----未加速的方案
