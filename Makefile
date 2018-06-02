@@ -1,4 +1,4 @@
-SUBDIRS=bf cf tstat-dpdk
+SUBDIRS=bf cf-dpdk tstat
 ROOTDIR = $(shell pwd)
 export ROOTDIR
 
