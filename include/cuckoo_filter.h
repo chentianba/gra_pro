@@ -1,8 +1,8 @@
 #include <inttypes.h>
 
 #define MAX_BUCKET_SIZE 4
-#define MAX_TABLE_SIZE 100
-#define MAX_TABLE_BYTE 10000
+#define MAX_TABLE_SIZE 10000
+#define MAX_TABLE_BYTE 1000000
 #define MAX_SIZE_ENTRY 4
 #define ENTRY_MASK 0x11111111
 

@@ -1,0 +1,55 @@
+#! /bin/bash
+
+function net() {
+	ifconfig $1 down
+	ifconfig $2 down
+	./usertools/dpdk-devbind.py -b igb_uio $1 $2
+	./usertools/dpdk-devbind.py --status-dev net
+}
+
+function hugepages() {
+#	path=/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+	path=/sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+	echo 512 > $path
+	cat $path
+}
+
+function uio() {
+	modprobe uio
+	insmod x86_64-native-linuxapp-gcc/kmod/igb_uio.ko
+}
+
+function start() {
+	option=$1
+	dev1=$2
+	dev2=$3
+	if [ "$option" == "net" ]; then
+		net $dev1 $dev2
+	fi
+	if [ "$option" == "hugepages" ]; then
+		hugepages
+	fi
+	if [ "$option" == "uio" ]; then
+		uio
+	fi
+	if [ "$option" == "all" ]; then
+		hugepages
+		uio
+		net $dev1 $dev2
+	fi
+}
+
+#
+# Here is the entry.
+#
+
+if [ "$1" == "windows" ]; then
+	echo "windows"
+	# Windows VirtualBox
+else
+	echo "linux"
+	# Linux VirtualBox
+	start all eth7  eth9
+fi
+
+source /home/ctbsky/dpdk/dpdkrc
